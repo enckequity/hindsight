@@ -1092,7 +1092,12 @@ function stubFetchRouted(
       const method = init?.method;
       calls.push({ url, method, body: init?.body ? JSON.parse(init.body) : undefined });
       const route = routes.find((r) => r.match(method, url));
-      return { ok: true, status: 200, json: async () => route?.json ?? { ok: true } } as any;
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          route?.json ?? (url.includes("/operations/") ? { status: "completed" } : { ok: true }),
+      } as any;
     })
   );
 }
@@ -1134,6 +1139,118 @@ describe("HindsightClient.ensureFolder", () => {
 });
 
 describe("HindsightClient.captureInitiative", () => {
+  it("waits for the initial marker before creating one manual page", async () => {
+    vi.useFakeTimers();
+    const calls: { url: string; body?: any }[] = [];
+    let status = "running";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push({ url, body: init.body ? JSON.parse(String(init.body)) : undefined });
+        const json = url.endsWith("/memories")
+          ? { operation_id: "marker-op" }
+          : url.endsWith("/operations/marker-op")
+            ? { status }
+            : url.endsWith("/knowledge-base/tree")
+              ? { roots: [] }
+              : url.endsWith("/knowledge-base/folders")
+                ? { id: "folder" }
+                : { page_id: "page" };
+        return new Response(JSON.stringify(json));
+      })
+    );
+    try {
+      const c = new HindsightClient({ apiUrl: "http://x", bank: "repo-a" });
+      const trigger = buildPageTrigger(resolveConfig({ pageTriggerType: "manual" }));
+      const capture = c.captureInitiative({
+        title: "Retry",
+        summary: "New evidence",
+        pageTrigger: trigger,
+        stamp: { tags: ["project:repo-a"], metadata: { project: "repo-a", source: "configured" } },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls.filter((c) => c.url.includes("/knowledge-base/"))).toEqual([]);
+      status = "completed";
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(capture).resolves.toEqual({ page_id: "page" });
+      const markers = calls.filter((c) => c.url.endsWith("/memories"));
+      expect(markers).toHaveLength(1);
+      expect(markers[0].body.items[0].metadata).toEqual({
+        project: "repo-a",
+        source: "configured",
+      });
+      expect(markers[0].body.items[0].tags).toEqual(["project:repo-a", "knowledge:feature-work"]);
+      expect(calls.filter((c) => c.url.endsWith("/knowledge-base/pages"))).toHaveLength(1);
+      expect(calls.some((c) => c.url.includes("/refresh"))).toBe(false);
+      expect(calls.find((c) => c.url.endsWith("/knowledge-base/pages"))!.body.trigger).toEqual(
+        trigger
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["failed", "cancelled", "error", "running", "missing receipt"])(
+    "does not create a page when the marker is %s",
+    async (status) => {
+      vi.useFakeTimers();
+      const urls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          urls.push(url);
+          return new Response(
+            JSON.stringify(
+              url.endsWith("/memories")
+                ? status === "missing receipt"
+                  ? {}
+                  : { operation_id: "marker-op" }
+                : { status }
+            )
+          );
+        })
+      );
+      try {
+        const c = new HindsightClient({ apiUrl: "http://x", bank: "repo-a" });
+        const capture = expect(
+          c.captureInitiative({ title: "Retry", summary: "New evidence" })
+        ).rejects.toThrow(/initiative|operation/i);
+        await vi.advanceTimersByTimeAsync(120_000);
+        await capture;
+        expect(urls.some((u) => u.includes("/knowledge-base/"))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("scopes a stable initial marker identity by bank, project and exact title", async () => {
+    const ids: string[] = [];
+    for (const [bank, project, title] of [
+      ["shared/α", "repo/雪", "Upload/é"],
+      ["shared/α", "repo/雪", "Upload/é"],
+      ["other", "repo/雪", "Upload/é"],
+      ["shared/α", "other", "Upload/é"],
+      ["shared/α", "repo/雪", "Upload-é"],
+    ]) {
+      const calls: any[] = [];
+      stubFetchRouted(calls, [
+        { match: (m, u) => m === "POST" && u.endsWith("/memories"), json: { operation_id: "op" } },
+        {
+          match: (m, u) => m === "POST" && u.endsWith("/knowledge-base/pages"),
+          json: { page_id: "pg" },
+        },
+      ]);
+      await new HindsightClient({ apiUrl: "http://x", bank, project }).captureInitiative({
+        title,
+        summary: "Current intent",
+      });
+      ids.push(calls.find((c) => c.url.endsWith("/memories")).body.items[0].document_id);
+    }
+    expect(ids[0]).toBe(ids[1]);
+    expect(new Set([ids[0], ...ids.slice(2)]).size).toBe(4);
+  });
+
   // The subject is a property of the BANK (`project` when it is one repo's, the bank id otherwise
   // — #4146), exactly as it is for the seeded pages.
   it("names the repository, not the bank, when the client knows one", async () => {
@@ -1163,7 +1280,7 @@ describe("HindsightClient.captureInitiative", () => {
     expect(pagePost.body.source_query).toContain(pageScopeRule("dotfiles"));
   });
 
-  it("new initiative: POSTs a per-initiative page + a marker retain naming the same page id", async () => {
+  it("new initiative: retains searchable evidence before creating the server-assigned page", async () => {
     const calls: any[] = [];
     stubFetchRouted(calls, [
       { match: (m, u) => m === "GET" && u.endsWith("/knowledge-base/tree"), json: { roots: [] } },
@@ -1206,27 +1323,20 @@ describe("HindsightClient.captureInitiative", () => {
     expect(pagePost.body.source_query).toContain(pageScopeRule());
     expect(pagePost.body.max_tokens).toBe(PAGE_MAX_TOKENS);
 
-    // Marker retain POST to /memories. The page id rides on the metadata and on the context —
-    // NEVER on a tag: tags are matched with exact set-ops against a fixed vocabulary, and one
-    // more tag value per initiative both isolates nothing and pollutes every fact (#3641).
+    // The initial marker precedes the server-assigned page id, so it carries title context.
+    // Updates below retain their existing page provenance without extracting this marker twice.
     const memPost = calls.find((k) => k.method === "POST" && k.url.endsWith("/memories"));
     expect(memPost).toBeDefined();
     const item = memPost.body.items[0];
     expect(item.tags).toEqual(["knowledge:feature-work"]);
-    expect(item.metadata).toEqual({ relatedPageId: "pg" });
-    // The context is the one channel a page synthesis reads back (reflect strips `metadata` from
-    // its search results), so this is what lets the overview link to the REAL page id.
-    expect(item.context).toBe("initiative marker for [[page:pg]]");
+    expect(item.metadata).toEqual({});
+    expect(item.context).toBe('initiative marker for "Retry backoff for the uploader"');
     expect(item.strategy).toBe("document");
     // A marker consolidates into the same single scope as everything else this plugin writes.
     expect(item.observation_scopes).toBe("shared");
     expect(memPost.body.async).toBe(true);
-    // A stable per-initiative document id (NOT the page id itself), so a recapture upserts.
-    expect(item.document_id).toBe("initiative-marker-pg");
-
-    // The returned page id and the id the marker names must be the same (the real page node id).
-    expect(item.metadata.relatedPageId).toBe(result.page_id);
-    expect(item.context).toContain(`[[page:${result.page_id}]]`);
+    expect(item.document_id).toMatch(/^initiative-marker-[0-9a-f-]{36}$/);
+    expect(calls.indexOf(memPost)).toBeLessThan(calls.indexOf(pagePost));
   });
 
   /** An initiative page is one of these pages, so it is staggered on the same terms — seeded by
@@ -1425,7 +1535,8 @@ describe("HindsightClient.configureBank — missions are seeded once (#2492)", (
         return {
           ok: route?.ok ?? true,
           status: route?.ok === false ? 404 : 200,
-          json: async () => route?.json ?? { ok: true },
+          json: async () =>
+            route?.json ?? (url.includes("/operations/") ? { status: "completed" } : { ok: true }),
         } as any;
       })
     );
@@ -1522,7 +1633,12 @@ describe("HindsightClient.configureBank — missions are seeded once (#2492)", (
         const method = init?.method;
         calls.push({ url, method, body: init?.body ? JSON.parse(init.body) : undefined });
         const route = routeList.find((r) => r.match(method, url));
-        return { ok: true, status: 200, json: async () => route?.json ?? { ok: true } } as any;
+        return {
+          ok: true,
+          status: 200,
+          json: async () =>
+            route?.json ?? (url.includes("/operations/") ? { status: "completed" } : { ok: true }),
+        } as any;
       })
     );
     await new HindsightClient({ apiUrl: "http://x", bank: "repo-a" }).configureBank({

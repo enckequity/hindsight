@@ -24,6 +24,7 @@ import {
 import { version as PKG_VERSION } from "../../package.json";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
+import { uuidV5 } from "./uuid";
 
 /** Sent on every request so the server can tell which integration is calling. */
 export const USER_AGENT = `hindsight-coding-agents/${PKG_VERSION}`;
@@ -144,6 +145,8 @@ export interface RetainOpts {
   /** Deterministic operation id: re-submitting the same payload returns the original operation
    *  instead of admitting a second one. Ignored by servers older than 0.8.6. */
   operationId?: string;
+  /** An explicit tool may need searchable evidence before its next write. Hooks never wait. */
+  waitForCompletionMs?: number;
 }
 
 /** First release whose retain endpoint honours a caller-supplied `operation_id` (#2937, v0.8.6).
@@ -497,8 +500,8 @@ export class HindsightClient {
     return r;
   }
 
-  /** Retain one memory. ALWAYS async: enqueue extraction server-side and collect its op-id for
-   *  drain(). Nothing in this plugin can afford to block a coding agent's hook on extraction. */
+  /** Retain one memory asynchronously and collect its operation id for drain(). Hooks never
+   *  wait; an explicit tool can opt into completion before creating a dependent page. */
   async retain(
     content: string,
     context: string,
@@ -524,11 +527,18 @@ export class HindsightClient {
     const body: Record<string, unknown> = { items: [item], async: true };
     if (opts.operationId) body.operation_id = opts.operationId;
     const r = await this.req("POST", this.bankUrl("/memories"), body);
+    let operationId: string | undefined;
     try {
       const j = (await r.json()) as { operation_id?: string };
-      if (j.operation_id) this.opIds.push(j.operation_id);
+      operationId = j.operation_id;
+      if (operationId) this.opIds.push(operationId);
     } catch {
-      /* ignore */
+      /* A fire-and-forget retain can proceed without a receipt; a dependent write cannot. */
+    }
+    if (opts.waitForCompletionMs !== undefined) {
+      if (!operationId)
+        throw new Error("Retain returned no operation id; cannot confirm initiative evidence");
+      await this.drain([operationId], "initiative marker", opts.waitForCompletionMs, true);
     }
   }
 
@@ -741,9 +751,15 @@ export class HindsightClient {
    * Concurrency is capped at `maxParallelRetains` (the API rate-limits bursts, not single
    * requests — a 200 to a lone GET with 429s under `Promise.all` over every pending op). A 429
    * leaves the op pending and backs the next cycle off by its `Retry-After` (10s floor) instead
-   * of hammering the next cycle 5s later.
+   * of hammering the next cycle 5s later. `requireSuccess` makes a dependent write fail closed:
+   * failed or unconfirmed operations throw, and individual requests share the polling deadline.
    */
-  async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<void> {
+  async drain(
+    ids: string[],
+    label: string,
+    maxMs = 60 * 60 * 1000,
+    requireSuccess = false
+  ): Promise<void> {
     if (!ids.length) return;
     this.log(`[wait] draining ${ids.length} ${label} operations …`);
     const start = Date.now();
@@ -761,7 +777,12 @@ export class HindsightClient {
       let backoffMs = POLL_CYCLE_MS;
       await pool([...pending], this.maxParallelRetains, async (id) => {
         try {
-          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), { method: "GET" });
+          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), {
+            method: "GET",
+            ...(requireSuccess
+              ? { signal: AbortSignal.timeout(Math.max(1, maxMs - (Date.now() - start))) }
+              : {}),
+          });
           if (r.status === 429) {
             backoffMs = Math.min(
               RETRY_AFTER_CEILING_MS,
@@ -791,13 +812,21 @@ export class HindsightClient {
       });
       if (pending.size) {
         this.log(`  … ${pending.size}/${ids.length} ${label} ops pending`);
-        await sleep(backoffMs);
+        await sleep(
+          requireSuccess
+            ? Math.min(backoffMs, Math.max(0, maxMs - (Date.now() - start)))
+            : backoffMs
+        );
       }
     }
     this.log(
       `[wait] ${label} drained — ${ids.length - pending.size} done, ${failed} failed` +
         (pending.size ? `, ${pending.size} still pending at timeout` : "")
     );
+    if (requireSuccess && (failed || pending.size))
+      throw new Error(
+        `${label} operations did not complete successfully: ${failed} failed, ${pending.size} pending`
+      );
   }
 
   /**
@@ -1172,7 +1201,7 @@ export class HindsightClient {
    * Update (relatesToPageId) → no new page; only a marker accruing to the existing page, so an
    * enhancement or a mid-work plan change lands on the initiative it belongs to.
    *
-   * The marker carries its page id in two places, neither of them a tag (#3641):
+   * An update marker carries its page id in two places, neither of them a tag (#3641):
    * `metadata.relatedPageId` for provenance (visible on the document, and to a reflect loop that
    * expands one), and a `[[page:<id>]]` link in the retain CONTEXT, which is the only one of the
    * three channels a page synthesis actually reads — reflect's search results keep `context` and
@@ -1188,11 +1217,32 @@ export class HindsightClient {
      *  carry its own hardcoded copy of this trigger. */
     pageTrigger?: PageTrigger;
   }): Promise<{ page_id: string }> {
-    // `/knowledge-base/pages` mints its OWN page id (kp-…); we can't set it. So for a new initiative
-    // we create the page first and adopt the server-assigned id — that id is what the return value
-    // and the marker must use, or `read_knowledge_page(id)` 404s and the `[[page:<id>]]` link
-    // points at nothing.
-    let pageId = args.relatesToPageId;
+    const pageIdForUpdate = args.relatesToPageId;
+    // Page creation immediately schedules synthesis, but its id is assigned by the server. Retain
+    // the initial evidence first, identified by the exact title and bank/project rather than a
+    // lossy slug. It cannot link a page that does not exist yet; updates keep their page link.
+    // Previously creation ran first and could synthesize unrelated older evidence (#6448).
+    const markerId = pageIdForUpdate
+      ? `initiative-marker-${this.slugify(pageIdForUpdate)}-update`
+      : `initiative-marker-${uuidV5(JSON.stringify([this.bank, this.project ?? null, args.title]))}`;
+    const verb = pageIdForUpdate ? "Update to an existing initiative" : "New initiative";
+    await this.retain(
+      `${verb}: ${args.title}. ${args.summary}`,
+      pageIdForUpdate
+        ? `initiative marker for [[page:${pageIdForUpdate}]]`
+        : `initiative marker for "${args.title}"`,
+      markerId,
+      [...new Set([...(args.stamp?.tags ?? []), "knowledge:feature-work"])],
+      "document",
+      {
+        metadata: {
+          ...(args.stamp?.metadata ?? {}),
+          ...(pageIdForUpdate ? { relatedPageId: pageIdForUpdate } : {}),
+        },
+        ...(!pageIdForUpdate ? { waitForCompletionMs: 60_000 } : {}),
+      }
+    );
+    let pageId = pageIdForUpdate;
     if (!pageId) {
       const folderId = await this.ensureFolder("Initiatives");
       // Same subject scoping and budget as the seeded pages: an initiative page synthesizes from
@@ -1219,22 +1269,6 @@ export class HindsightClient {
       }
       pageId ||= `initiative-${this.slugify(args.title)}`; // last resort if the response lacked an id
     }
-    // "Update", not "Enhancement": a recapture is just as often a plan change (scope/goal/why
-    // rewritten) as an addition, and this string is what the page synthesis reads.
-    const verb = args.relatesToPageId ? "Update to an existing initiative" : "New initiative";
-    const content = `${verb}: ${args.title}. ${args.summary}`;
-    // A STABLE id per initiative, so a recapture upserts instead of adding one more document every
-    // call (#5076). Keyed on the page, not the title — a recapture may reword it — and two slots:
-    // the creation marker keeps what the initiative set out to do, the update marker holds the
-    // latest plan change (a newer update supersedes the older one).
-    const markerId = `initiative-marker-${this.slugify(pageId)}${args.relatesToPageId ? "-update" : ""}`;
-    const tags = [...new Set([...(args.stamp?.tags ?? []), "knowledge:feature-work"])];
-    // The context rides on every fact extracted from this marker, verbatim (ExtractedFact.context),
-    // so the Initiatives overview can link an initiative to its own page from what it retrieved.
-    const context = `initiative marker for [[page:${pageId}]]`;
-    await this.retain(content, context, markerId, tags, "document", {
-      metadata: { ...(args.stamp?.metadata ?? {}), relatedPageId: pageId },
-    });
     return { page_id: pageId };
   }
 

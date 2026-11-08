@@ -146,6 +146,22 @@ describe("HindsightClient.hasDocuments", () => {
 });
 
 describe("HindsightClient.drain", () => {
+  it("bounds a stalled operation request when completion is required", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) =>
+            init.signal!.addEventListener("abort", () => reject(init.signal!.reason), {
+              once: true,
+            })
+          )
+      )
+    );
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    await expect(client.drain(["op"], "initiative marker", 20, true)).rejects.toThrow("1 pending");
+  });
+
   it("polls at most maxParallelRetains ops concurrently", async () => {
     const cap = 2;
     const client = new HindsightClient({ apiUrl: "http://x", bank: "b", maxParallelRetains: cap });

@@ -94,6 +94,7 @@ def _install_hermes_stubs(hermes_home: Path) -> None:
     module(
         "agent.memory_provider",
         MemoryProvider=MemoryProvider,
+        PRE_COMPRESS_CHECKPOINT_API_VERSION=2,
         RecallStatus=RecallStatus,
         spawn_context_thread=_spawn_context_thread,
     )

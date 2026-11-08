@@ -294,6 +294,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns. Sub-agent (`delegate_task`) runs and kanban workers are never auto-retained; their parent session keeps its own turns. |
 | `retain_cron` | `false` | Also auto-retain scheduled (cron) runs. Off by default, so job output stays out of the user's memory; the `hindsight_retain` tool still works in cron runs. |
+| `checkpoint_enabled` | `false` | Opt in to verified full-text archives before compaction. Requires a connected compatible client and the same automatic-retention permission as normal conversation capture. |
 | `retain_async` | `true` | Process retain asynchronously on the Hindsight server |
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
@@ -313,6 +314,18 @@ The lookup stops at the repository root. Only `bank_id` is read.
 - If the server accepts a save and its processing fails later, the plugin asks the server to retry it, up to 3 times. It checks before each new save, so a failure after the process exits is not retried; retry it from the control plane.
 - If the bank keeps no document text (`store_document_text` off), it can't append to a session document. The plugin then stops appending and stores the turns in a separate document per process instead.
 - An error that can never succeed (any other 4xx) is logged and the save is dropped.
+
+### Verified pre-compress checkpoints
+
+`checkpoint_enabled: true` opts this provider instance into Hermes checkpoint API v2. It is off by default because each new checkpoint can use retain, embedding, indexing and consolidation budget. It does not change ordinary session capture, bank missions, strategies or spending limits. Enable Hermes' `compression.checkpoint_required` only after qualifying the provider and deployment together.
+
+The provider requires a Hermes host exposing checkpoint API v2 and its normalized-evidence handoff. It advertises v2 only after a client is connected and exposes the native bank-config, document and retain APIs. Normal recall or retention establishes that connection; checkpointing never starts an embedded daemon or retries a disconnected client. Until then, strict compaction refuses to proceed. `auto_retain: false`, sub-agent and Kanban contexts refuse checkpoints; cron requires both `retain_cron: true` and `checkpoint_enabled: true`.
+
+The host supplies normalized, redacted direct user/assistant evidence. The provider writes it to a separate content-addressed document whose identity also includes a hash of the bound profile home and session, completes synchronous native retention, then reads the original text back and compares it exactly. All configured write banks must pass; recall-only banks receive no writes. An existing exact checkpoint is reused. Ordinary session documents are never overwritten or appended by this hook. The returned summary context contains the document ID and digest, not the archived conversation.
+
+The entire operation shares the configured `timeout`, including bank checks and every write/read request. A 1 MiB UTF-8 limit rejects oversized serialized evidence without truncation. Every bank and effective retain strategy must keep `store_document_text: true`; a configured unknown strategy is refused rather than silently falling back. No strategy is created or modified. Native `chunks` mode can skip the extraction LLM when a bank administrator explicitly configures it, but indexing and possible consolidation still do work. A batch-only deployment that rejects synchronous retain is unsupported by this checkpoint path.
+
+A queued receipt, missing or altered text, authorization error, timeout or other failure never counts as an archive. The provider raises even in best-effort mode because Hermes treats any non-throwing v2 return as checkpoint success. Strict mode then keeps the original evidence. A timed-out write may still commit server-side: cancellation is not a rollback. A later attempt reads the same deterministic document before considering a write. Exact archival readback does not prove recall/search quality, and checkpoints remain subject to the bank's normal deletion and retention policy.
 
 ### Integration
 

@@ -34,6 +34,7 @@ from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from utils import read_json_or_empty
 
+from .checkpoint import Checkpoint, retain_checkpoint
 from .embedded import (
     _CLIENT_MODULES,
     _RETRIABLE_CONNECTION_MARKERS,
@@ -54,6 +55,7 @@ from .embedded import (
 )
 from .settings import (
     _DEFAULT_API_URL,
+    _DEFAULT_CHECKPOINT_ENABLED,
     _DEFAULT_IDLE_TIMEOUT,
     _DEFAULT_LOCAL_URL,
     _DEFAULT_OBSERVATION_SCOPES,
@@ -338,14 +340,19 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
+def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT, *, cancel_on_timeout: bool = False):
     """Schedule *coro* on the shared loop and block until done."""
     from agent.async_utils import safe_schedule_threadsafe
 
     future = safe_schedule_threadsafe(coro, _get_loop())
     if future is None:
         raise RuntimeError("Hindsight loop unavailable")
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        if cancel_on_timeout:
+            future.cancel()
+        raise
 
 
 RETAIN_SCHEMA = {
@@ -563,6 +570,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._observation_scopes: Any = None
         self._retain_source = _DEFAULT_RETAIN_SOURCE
         self._retain_strategy = _DEFAULT_RETAIN_STRATEGY
+        self._checkpoint_enabled = _DEFAULT_CHECKPOINT_ENABLED
+        self._checkpoint_home = ""
         self._retain_user_prefix, self._retain_assistant_prefix = "User", "Assistant"
         self._turn_counter = self._turn_index = 0
         self._session_turns: list[str] = []  # ALL turns for the session
@@ -836,6 +845,11 @@ class HindsightMemoryProvider(MemoryProvider):
             },
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {
+                "key": "checkpoint_enabled",
+                "description": "Verify a durable full-text archive before compaction (opt-in; uses retain/indexing budget)",
+                "default": False,
+            },
+            {
                 "key": "retain_cron",
                 "description": "Also auto-retain scheduled (cron) runs; off by default so job output stays out of the user's memory",
                 "default": False,
@@ -1001,11 +1015,23 @@ class HindsightMemoryProvider(MemoryProvider):
         """Schedule *coro* on the shared loop using the configured timeout."""
         return _run_sync(coro, timeout=self._timeout)
 
-    def _run_hindsight_operation(self, operation, *, repeatable: bool = True):
+    def _run_hindsight_operation(self, operation, *, repeatable: bool = True, deadline: float | None = None):
         """Run an async client operation, recreating the client and retrying once when its
         connection went stale: for local_embedded, a daemon that is no longer there; in any mode,
         a pooled connection the server already closed (#5734). The server may have read a request
         it dropped mid-way, so that retry is only for a *repeatable* operation."""
+        if deadline is not None:
+            # Checkpoints use only the connected client: starting an embedded daemon or retrying
+            # an uncertain write would escape their deadline and could duplicate paid work.
+            client = self._client
+            if client is None:
+                raise RuntimeError("Hindsight checkpoint requires a connected client")
+
+            async def bounded() -> Any:
+                async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                    return await operation(client)
+
+            return _run_sync(bounded(), timeout=max(0, deadline - time.monotonic()), cancel_on_timeout=True)
         try:
             return self._run_sync(operation(self._get_client()))
         except Exception as exc:
@@ -1283,6 +1309,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
+        self._checkpoint_home = str(Path(kwargs.get("hermes_home") or get_hermes_home()).resolve())
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
         # "primary" | "subagent" | "cron" | "flush" from Hermes, plus our own "kanban" below;
         # read by _apply_retain_policy (#4945).
@@ -1543,6 +1570,7 @@ class HindsightMemoryProvider(MemoryProvider):
         context = getattr(self, "_agent_context", "primary")
         skip = context in ("subagent", "kanban") or (context == "cron" and not cfg.get("retain_cron", False))
         self._auto_retain = bool(cfg.get("auto_retain", True)) and not skip
+        self._checkpoint_enabled = cfg.get("checkpoint_enabled", _DEFAULT_CHECKPOINT_ENABLED) is True
         self._retain_every_n_turns = max(1, _parse_int_setting(cfg.get("retain_every_n_turns"), 1))
         self._retain_context = cfg.get("retain_context", _RETAIN_CONTEXT_DEFAULT)
         self._retain_async = cfg.get("retain_async", True)
@@ -1854,6 +1882,68 @@ class HindsightMemoryProvider(MemoryProvider):
                 ("assistant", self._retain_assistant_prefix, assistant_content),
             )
         ]
+
+    @property
+    def pre_compress_checkpoint_api_version(self) -> int:
+        """Advertise v2 only for an opted-in, policy-allowed, connected instance."""
+        client = self._client
+        ready = (
+            self._checkpoint_enabled
+            and getattr(sys.modules.get("agent.memory_provider"), "PRE_COMPRESS_CHECKPOINT_API_VERSION", 0) >= 2
+            and getattr(self, "_auto_retain", False)
+            and self._mode != "disabled"
+            and self._session_id
+            and self._write_bank_ids
+            and callable(getattr(getattr(client, "banks", None), "get_bank_config", None))
+            and callable(getattr(getattr(client, "documents", None), "get_document", None))
+            and callable(getattr(getattr(client, "memory", None), "retain_memories", None))
+        )
+        return 2 if ready else 1
+
+    def on_pre_compress(self, messages: list[dict[str, Any]], *, require_checkpoint: bool = False) -> str:
+        """Archive host-normalized evidence before compaction; any failure must raise.
+
+        Hermes treats even an empty non-throwing v2 return as success. It decides whether a
+        failure blocks compaction, so best-effort hooks must not swallow archival failures.
+        """
+        deadline = time.monotonic() + self._timeout
+        if self.pre_compress_checkpoint_api_version < 2:
+            raise RuntimeError("Hindsight checkpoint is disabled, disallowed, or not connected")
+        try:
+            from hindsight_client_api.models.memory_item import MemoryItem
+            from hindsight_client_api.models.retain_request import RetainRequest
+
+            checkpoint = Checkpoint.from_messages(messages, self._session_id, self._checkpoint_home)
+            item = self._build_retain_kwargs(
+                checkpoint.content,
+                context=self._retain_context,
+                metadata={
+                    **self._build_metadata(message_count=len(messages), turn_index=self._turn_index),
+                    "checkpoint_api_version": "2",
+                    "sha256": checkpoint.digest,
+                },
+            )
+            payload = {**item, "document_id": checkpoint.document_id}
+            memory_item = MemoryItem.from_dict(payload)
+            serialized = memory_item.to_dict()
+            # SDKs normalize ISO timestamps to datetime objects. Policy fields must survive intact:
+            # an older schema must not silently drop a tag scope or retain strategy.
+            if any(serialized.get(key) != value for key, value in payload.items() if key != "timestamp"):
+                raise ValueError("checkpoint client cannot preserve the retain policy fields")
+            request = RetainRequest(items=[memory_item], var_async=False)
+            banks = list(self._write_bank_ids)
+            self._run_hindsight_operation(
+                lambda client: retain_checkpoint(
+                    client, checkpoint, bank_ids=banks, request=request, deadline=deadline
+                ),
+                repeatable=False,
+                deadline=deadline,
+            )
+        except Exception:
+            # Provider errors can contain request bodies or private server detail. Keep them out of
+            # the host's error/log context; a timeout cannot promise the server rolled back the write.
+            raise RuntimeError("Hindsight checkpoint could not be verified; original evidence must be kept") from None
+        return f"Hindsight checkpoint verified in {len(banks)} bank(s): {checkpoint.document_id} (SHA-256 {checkpoint.digest})."
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {

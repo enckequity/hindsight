@@ -83,6 +83,13 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Folders whose git repositories may choose their own bank with a .hindsight/config.toml (comma-separated). Empty = repository config files are ignored.",
         ),
         ProviderField(
+            key="checkpoint_enabled",
+            label="Pre-compress checkpoints",
+            kind=KIND_BOOL,
+            default=False,
+            description="Archive and verify full text before compaction; requires retention permission and a connected client.",
+        ),
+        ProviderField(
             key="recall_budget",
             label="Recall budget",
             kind=KIND_SELECT,
